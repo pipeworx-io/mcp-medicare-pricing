@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/medicare-pricing",
+  "title": "Medicare Pricing",
+  "description": "What does Medicare PAY — physician fee schedule, lab rates, and per-day unit",
+  "version": "0.1.0",
+  "websiteUrl": "https://pipeworx.io/packs/medicare-pricing",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-medicare-pricing",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/medicare-pricing/mcp"
+    }
+  ]
+}
