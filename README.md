@@ -4,7 +4,7 @@ What Medicare **pays** — physician fee schedule, lab rates, and per-day unit
 limits. The companion to `medicare-coverage`, which answers whether something is
 covered but not what it is worth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
 
 ## Tools
 
@@ -12,6 +12,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 |---|---|
 | `medicare_physician_payment` | "How much does Medicare pay for 99213 in Los Angeles?" — RVUs and dollars, locality-adjusted. |
 | `medicare_lab_rate` | "What does a comprehensive metabolic panel reimburse?" — national CLFS rate. |
+| `medicare_lab_test_lookup` | "What does Medicare pay for Signatera, and which MolDX LCD applies?" — brand name → PLA code, current CLFS rate, and the MolDX LCDs/articles for the test's category. |
 | `medicare_dmepos_rate` | "How much does Medicare pay for a CPAP machine (E0601) in Texas?" — state-priced, rural vs non-rural. |
 | `medicare_code_units_limit` | "How many units of this code will they pay for in one day?" — NCCI MUE. |
 | `check_code_pair` | "Can I bill 00142 and 64474 together?" — NCCI PTP edit + modifier indicator for a code pair. |
@@ -31,6 +32,51 @@ All from CMS, all downloadable files with no API:
 - **DMEPOS fee schedule** (durable medical equipment, prosthetics, orthotics, supplies) — quarterly (as necessary): A=Jan, B=Apr, C=Jul, D=Oct
 - **NCCI Medically Unlikely Edits** — quarterly
 - **NCCI PTP quarterly additions/deletions/revisions files** — quarterly (see below — a narrower source than the other three)
+
+## ADLT list — brand name to billing code
+
+`medicare_lab_test_lookup` exists because callers name a test by its brand
+("Signatera"), not its code ("0340U"), and nothing else in the catalog maps one
+to the other (fleet #2426).
+
+**Source, and why it is the only one.** CMS's list of Advanced Diagnostic
+Laboratory Tests
+(<https://www.cms.gov/files/document/advanced-diagnostic-laboratory-tests-under-medicare-clfs.pdf>)
+gives code, lab, proprietary test name, approval date and initial-period
+payment for 18 tests. It is a US federal work (17 USC 105). The sources that
+were checked and rejected:
+
+- **AMA PLA long-descriptor PDF** — "CPT® Copyright 2026 American Medical
+  Association. All rights reserved." It also lists only the codes changed in
+  the latest cycles (143 of them), and 0340U is not among them.
+- **Palmetto MolDX DEX registry** — needs a registered account, even for the
+  "public user" catalog, and hides Z-codes from public users. That's an auth
+  wall.
+- **CMS Coverage API article code tables** — need a caller's CMS/AMA licence
+  token (already how `medicare-coverage` handles it).
+- **NCBI GTR** — knows Signatera and Guardant360 but its `cptcode` field is
+  empty for them.
+
+So coverage is limited to ADLTs. A test outside the list gets
+`found: false, reason: not_on_adlt_list` and a pointer to `medicare_lab_rate`.
+
+**Copy, not proxy.** The list is a two-page PDF with no API, and the gateway
+has no PDF parser, so the rows are baked into `src/adlt.ts`. The PDF's "Test
+Descriptor" column is AMA PLA text and is **not** copied. Every call sends a
+HEAD to the PDF and compares `Last-Modified` with the snapshot's. If CMS has
+republished, the response carries `snapshot_current: false`. To refresh:
+download the PDF, extract its text (`pypdf` works), update the rows in
+`src/adlt.ts`, and bump `ADLT_DATA_AS_OF` and `SNAPSHOT_LAST_MODIFIED`.
+
+**Coverage.** Each test has a `coverage_topic`, a phrase that is ours and not
+CMS's. It matches the title of the MolDX LCD/article family for the test's
+category (for Signatera, "Minimal Residual Disease"). The tool reads the live,
+keyless CMS Coverage API reports and returns the active LCDs and billing
+articles with that title. Retired ones come back only with
+`include_retired: true`. This matters because contractors re-issue MolDX
+policies under new numbers: Noridian's L38816 and A58456 were retired
+2026-02-05 and replaced by L38814 and A58454. Whether a specific test is listed
+is answered by the billing article's code table, not by the title match.
 
 ## Vintage is not a detail
 
@@ -247,7 +293,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1683+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

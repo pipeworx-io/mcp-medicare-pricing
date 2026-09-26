@@ -452,7 +452,42 @@ async function fetchWithTimeout(
         ),
       );
     }
-    throw err;
+    // Fleet #2382. Everything that isn't a timeout/abort here is a genuine
+    // NETWORK-LEVEL failure — DNS resolution, connection refused, TLS handshake,
+    // Cloudflare's own "Network connection lost." — meaning `fetch()` itself
+    // threw and no HTTP response of any kind was ever received. Until this fix
+    // that raw exception was rethrown VERBATIM: a bare `TypeError: fetch failed`
+    // (or the Workers-runtime equivalent) names no upstream, carries no class
+    // token, and reads exactly like a defect in OUR code — because it says
+    // nothing about the call at all. It landed in `error`, the tier that means
+    // "Pipeworx has a defect", for every one of the (at the time of writing)
+    // ~470 packs that call this helper directly with no wrapper of their own.
+    //
+    // `dexscreener` hit this independently (fleet #1579) and fixed it with a
+    // bespoke per-pack try/catch around `fetchWithTimeout`. That fix is correct
+    // but only covers one pack; every other caller of this shared helper still
+    // leaked the raw exception. Moving the same fix HERE — the one place that
+    // already carries the timeout case — covers every pack that uses
+    // `fetchWithTimeout` without a wrapper, for free, and without widening
+    // `classifyToolError`'s regex list: the fix is giving the message a proper
+    // `upstream_down:` token at the point the two facts (no response was ever
+    // received, and which host we were trying to reach) are actually in hand,
+    // not teaching the classifier to guess from prose after the fact.
+    //
+    // Safe on the same grounds as the timeout branch above: no argument a
+    // caller passes can make `fetch()` itself throw a connection-level error,
+    // so this is always an availability failure, never a caller mistake. Same
+    // `markInternalOrigin` treatment — an origin we run that never answered is
+    // still ours, not a third party's outage.
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      markInternalOrigin(
+        `upstream_down: could not reach ${name} at all (${raw.slice(0, 160)}). ` +
+          `No request reached ${name}, so this says NOTHING about whether the arguments you passed ` +
+          'are valid — do not re-check them on the strength of this error. Retry shortly.',
+        url,
+      ),
+    );
   }
 }
 
@@ -704,6 +739,7 @@ function collapse(s: string): string {
  * returns year_not_loaded rather than silently substituting another vintage.
  */
 
+import { ADLT_DATA_AS_OF, ADLT_SOURCE_URL, SNAPSHOT_LAST_MODIFIED, matchAdlt, type AdltTest } from './adlt.js';
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
@@ -858,6 +894,19 @@ const tools: McpToolExport['tools'] = [
     },
   },
   {
+    name: 'medicare_lab_test_lookup',
+    description:
+      'Resolve a branded molecular or genomic lab test by its commercial name (e.g. Signatera, Guardant360 CDx, FoundationOne CDx, FoundationOne Liquid CDx, Tempus xT CDx, DecisionDx-Melanoma, Envisia, Shield) to its CPT PLA / HCPCS billing code, the lab that runs it, what Medicare pays for it now on the Clinical Laboratory Fee Schedule, and the MolDX local coverage determinations (LCDs) and billing-and-coding articles for its test category. Answers "what does Medicare pay for Signatera", "what is the PLA code for Guardant360", "which MolDX LCD covers this test". Also accepts a lab name (e.g. "Natera") or a code. Covers the tests on the CMS list of Advanced Diagnostic Laboratory Tests (ADLTs), the only public list that ties a test\'s brand name to its code; a test not on it returns not_found with the reason. Sourced from CMS (ADLT list, Clinical Laboratory Fee Schedule, Medicare Coverage Database).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        test: { type: 'string', description: 'The test\'s brand or commercial name ("Signatera", "Guardant360 CDx"), the lab ("Natera"), or its code ("0340U").' },
+        include_retired: { type: 'boolean', description: 'Also list retired LCDs/articles for the test category (default false). Contractors re-issue MolDX policies under new numbers, so an older citation may be a retired document.' },
+      },
+      required: ['test'],
+    },
+  },
+  {
     name: 'medicare_dmepos_rate',
     description:
       'What does Medicare pay for a piece of durable medical equipment, prosthetic, orthotic, or medical supply (DMEPOS)? Returns the fee-schedule amount for a HCPCS Level II code (E/K/L/A-codes — CPAP machines, wheelchairs, ostomy supplies, braces, oxygen equipment...) in a given US state, with SEPARATE rural and non-rural amounts, since Medicare pays DMEPOS by state rather than by the physician-fee-schedule locality. Answers "how much does Medicare pay for a CPAP machine (E0601)", "DMEPOS rate for a wheelchair in Texas", "what is the rural rate for this HCPCS code in Montana". '
@@ -924,6 +973,57 @@ const tools: McpToolExport['tools'] = [
     inputSchema: { type: 'object' as const, properties: {} },
   },
 ];
+
+/**
+ * The ADLT table is a baked copy of a CMS PDF, so every answer re-checks the
+ * PDF's Last-Modified against the snapshot. A changed date means CMS has
+ * republished the list and the copy may be missing a test — said, not hidden.
+ */
+async function adltSnapshotCheck(): Promise<{ snapshot_current: boolean | null; snapshot_note?: string }> {
+  try {
+    const res = await pwFetch(ADLT_SOURCE_URL, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Pipeworx/1.0; +https://pipeworx.io)' } });
+    const lm = res.ok ? res.headers.get('last-modified') : null;
+    if (!lm) return { snapshot_current: null, snapshot_note: `Could not re-check the CMS ADLT list (HTTP ${res.status}); results reflect the list as of ${ADLT_DATA_AS_OF}.` };
+    if (lm === SNAPSHOT_LAST_MODIFIED) return { snapshot_current: true };
+    return { snapshot_current: false, snapshot_note: `CMS republished the ADLT list (Last-Modified ${lm}) after the version these results reflect (${SNAPSHOT_LAST_MODIFIED}); a newly approved ADLT may be missing from these results.` };
+  } catch {
+    return { snapshot_current: null, snapshot_note: `Could not re-check the CMS ADLT list; results reflect the list as of ${ADLT_DATA_AS_OF}.` };
+  }
+}
+
+interface CoverageDoc {
+  document_display_id: string; document_type: string; title: string; contractor: string;
+  effective_date: string; retired: boolean; url: string;
+}
+
+/** CMS writes retirement_date as MM/DD/YYYY or "N/A"; a future date is still in effect. */
+function retiredBy(d: string): boolean {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(d);
+  return !!m && Date.UTC(+m[3], +m[1] - 1, +m[2]) <= Date.now();
+}
+
+/** Every final LCD and local article, keyless from the CMS Coverage API reports. null if CMS did not answer. */
+async function coverageIndex(): Promise<CoverageDoc[] | null> {
+  try {
+    const get = async (path: string) => {
+      const res = await pwFetch(`https://api.coverage.cms.gov/v1/reports/${path}/?page_size=5000`, { headers: { Accept: 'application/json' } });
+      if (!res.ok) throw new Error(String(res.status));
+      return ((await res.json()) as { data?: Record<string, unknown>[] }).data ?? [];
+    };
+    const [lcds, articles] = await Promise.all([get('local-coverage-final-lcds'), get('local-coverage-articles')]);
+    return [...lcds, ...articles].map((r) => ({
+      document_display_id: String(r.document_display_id ?? ''),
+      document_type: String(r.document_type ?? ''),
+      title: String(r.title ?? ''),
+      contractor: String(r.contractor_name_type ?? '').split(/\r?\n/)[0],
+      effective_date: String(r.effective_date ?? ''),
+      retired: /retired/i.test(String(r.note ?? '')) || retiredBy(String(r.retirement_date ?? '')),
+      url: String(r.url ?? ''),
+    }));
+  } catch {
+    return null;
+  }
+}
 
 async function resolveLocality(cfg: Cfg, q: unknown, year: number): Promise<{ chosen: Gpci | null; alternatives: Gpci[]; note: string }> {
   if (typeof q !== 'string' || !q.trim()) {
@@ -1029,6 +1129,73 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         year_was_defaulted: askedYear === null,
         note: 'National rate. The Clinical Laboratory Fee Schedule is not adjusted by locality, unlike physician services.',
         source: 'CMS Clinical Laboratory Fee Schedule',
+      };
+    }
+
+    case 'medicare_lab_test_lookup': {
+      const test = typeof args.test === 'string' ? args.test.trim() : '';
+      if (!test) return { found: false, reason: 'no_test', hint: 'Pass test, e.g. "Signatera".' };
+      const includeRetired = args.include_retired === true;
+      const { matched_by, tests } = matchAdlt(test);
+      const [snapshot, coverage] = await Promise.all([adltSnapshotCheck(), tests.some((t) => t.coverage_topic) ? coverageIndex() : Promise.resolve(null)]);
+      const provenance = {
+        source: 'CMS list of Advanced Diagnostic Laboratory Tests (ADLTs) under the Medicare CLFS; rates from the CMS Clinical Laboratory Fee Schedule; policies from the CMS Medicare Coverage Database',
+        source_url: ADLT_SOURCE_URL,
+        data_as_of: ADLT_DATA_AS_OF,
+        ...snapshot,
+      };
+      if (!tests.length) {
+        return {
+          found: false,
+          reason: 'not_on_adlt_list',
+          test,
+          hint: 'This test is not on CMS\'s ADLT list, which is the only public list that maps a lab test\'s brand name to its billing code. Most PLA codes are not ADLTs; the full PLA code list with proprietary names is published by the AMA under copyright. If you have the code (it usually ends in U, e.g. "0340U"), medicare_lab_rate gives its rate; medicare_lcd_search finds coverage policies by topic.',
+          ...provenance,
+        };
+      }
+      const results = await Promise.all(tests.map(async (t: AdltTest) => {
+        const rates = await pg<{ year: number; quarter: string; rate: number }>(cfg,
+          `clfs_rates?hcpcs=eq.${t.code}&select=year,quarter,rate&order=year.desc,quarter.desc&limit=1`);
+        // "Response to Comments" articles are the comment period's record, not policy.
+        const docs = t.coverage_topic && coverage
+          ? coverage.filter((d) => d.title.toLowerCase().includes(t.coverage_topic!.toLowerCase()) && !/^response to comments/i.test(d.title))
+          : [];
+        const active = docs.filter((d) => !d.retired);
+        const retired = docs.filter((d) => d.retired);
+        return {
+          code: t.code,
+          ...(t.code_note ? { code_note: t.code_note } : {}),
+          test_name: t.test_name,
+          lab: t.lab,
+          current_clfs_rate: rates.length
+            ? { rate_usd: rates[0].rate, fee_schedule_year: rates[0].year, quarter: rates[0].quarter, note: 'National rate; the CLFS is not adjusted by locality.' }
+            : { rate_usd: null, note: `${t.code} has no rate on the loaded Clinical Laboratory Fee Schedule (it may be contractor-priced).` },
+          adlt: {
+            approval_date: t.adlt_approval_date,
+            existing_adlt: t.existing_adlt,
+            new_adlt_initial_period: t.new_adlt_initial_period,
+            initial_period_payment_usd: t.initial_period_payment_usd,
+          },
+          coverage: t.coverage_topic
+            ? {
+                policy_topic: t.coverage_topic,
+                topic_note: 'Policies whose title matches this test\'s category (our topic mapping, not CMS\'s). Whether this specific test is listed is stated in the billing article\'s code table.',
+                active_documents: active.slice(0, 20),
+                active_count: active.length,
+                ...(includeRetired ? { retired_documents: retired.slice(0, 20) } : {}),
+                retired_count: retired.length,
+                ...(coverage === null ? { error: 'CMS Coverage API did not answer; retry, or use medicare_lcd_search with the policy_topic.' } : {}),
+              }
+            : { policy_topic: null, note: 'No MolDX local policy title matches this test\'s category; it may be covered nationally (NCD) or case by case.' },
+        };
+      }));
+      return {
+        found: true,
+        query: test,
+        matched_by,
+        tests: results,
+        no_descriptors_note: 'The AMA\'s CPT PLA descriptor text is not returned (AMA copyright); the test name and lab are CMS\'s.',
+        ...provenance,
       };
     }
 
