@@ -57,8 +57,26 @@ were checked and rejected:
 - **NCBI GTR** — knows Signatera and Guardant360 but its `cptcode` field is
   empty for them.
 
-So coverage is limited to ADLTs. A test outside the list gets
-`found: false, reason: not_on_adlt_list` and a pointer to `medicare_lab_rate`.
+That made coverage ADLT-only, and fleet #2458 measured the cost: Oncotype DX
+(81519, a Category I MAAA code, not an ADLT) routed here 5/5 and came back
+`found: false`. Resolution now runs through three sources in order:
+
+1. **CMS ADLT list** (`src/adlt.ts`, below).
+2. **MAAA brand table** (`src/brand-codes.ts`) -- non-ADLT branded tests whose
+   proprietary name is tied to a code in CPT Appendix O and which each have a
+   brand-named or category MolDX billing article on the CMS MCD (Oncotype DX
+   breast/DCIS/colon/prostate, Prosigna, MammaPrint, EndoPredict, Breast
+   Cancer Index, Cologuard, Prolaris, Decipher, Afirma, ConfirmMDx, 4Kscore).
+   Only brand -> code -> lab FACTS are kept, never AMA descriptor text. Every
+   code was checked to carry a CLFS rate on 2026-09-26. To add a row: confirm
+   the pair in a public source, confirm `medicare_lab_rate` has a rate, and set
+   `coverage_topic` to a phrase from a live MolDX article title.
+3. **NCBI GTR, live** -- where the performing lab registered a CPT code
+   (e.g. Afirma -> 81546, Decipher -> 81542). Labelled lab-reported. Sparse:
+   Oncotype DX and Signatera carry no code there, which is why it is last.
+
+A test found in none returns `found: false, reason: brand_not_found` with
+`sources_checked` naming all three, and a pointer to `medicare_lab_rate`.
 
 **Copy, not proxy.** The list is a two-page PDF with no API, and the gateway
 has no PDF parser, so the rows are baked into `src/adlt.ts`. The PDF's "Test

@@ -740,6 +740,7 @@ function collapse(s: string): string {
  */
 
 import { ADLT_DATA_AS_OF, ADLT_SOURCE_URL, SNAPSHOT_LAST_MODIFIED, matchAdlt, type AdltTest } from './adlt.js';
+import { BRAND_DATA_AS_OF, BRAND_SOURCE, BRAND_TESTS, gtrLookup, matchTests, norm as normName } from './brand-codes.js';
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
@@ -896,7 +897,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'medicare_lab_test_lookup',
     description:
-      'Resolve a branded molecular or genomic lab test by its commercial name (e.g. Signatera, Guardant360 CDx, FoundationOne CDx, FoundationOne Liquid CDx, Tempus xT CDx, DecisionDx-Melanoma, Envisia, Shield) to its CPT PLA / HCPCS billing code, the lab that runs it, what Medicare pays for it now on the Clinical Laboratory Fee Schedule, and the MolDX local coverage determinations (LCDs) and billing-and-coding articles for its test category. Answers "what does Medicare pay for Signatera", "what is the PLA code for Guardant360", "which MolDX LCD covers this test". Also accepts a lab name (e.g. "Natera") or a code. Covers the tests on the CMS list of Advanced Diagnostic Laboratory Tests (ADLTs), the only public list that ties a test\'s brand name to its code; a test not on it returns not_found with the reason. Sourced from CMS (ADLT list, Clinical Laboratory Fee Schedule, Medicare Coverage Database).',
+      'Resolve a branded molecular or genomic lab test by its commercial name (e.g. Signatera, Guardant360 CDx, FoundationOne CDx, FoundationOne Liquid CDx, Tempus xT CDx, DecisionDx-Melanoma, Envisia, Shield) to its CPT PLA / HCPCS billing code, the lab that runs it, what Medicare pays for it now on the Clinical Laboratory Fee Schedule, and the MolDX local coverage determinations (LCDs) and billing-and-coding articles for its test category. Answers "what does Medicare pay for Signatera", "what is the PLA code for Guardant360", "which MolDX LCD covers this test". Also accepts a lab name (e.g. "Natera") or a code. Also covers non-ADLT branded MAAA tests (Oncotype DX, Prosigna, MammaPrint, EndoPredict, Breast Cancer Index, Cologuard, Prolaris, Decipher, Afirma, ConfirmMDx, 4Kscore) and any test whose lab registered its code in the NCBI Genetic Testing Registry. Resolves in order: the CMS list of Advanced Diagnostic Laboratory Tests (ADLTs), a brand-to-code table of MAAA tests with MolDX billing articles, then NCBI GTR live; a test found in none returns brand_not_found naming every source checked. Sourced from CMS (ADLT list, Clinical Laboratory Fee Schedule, Medicare Coverage Database) and NCBI GTR.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1136,57 +1137,94 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       const test = typeof args.test === 'string' ? args.test.trim() : '';
       if (!test) return { found: false, reason: 'no_test', hint: 'Pass test, e.g. "Signatera".' };
       const includeRetired = args.include_retired === true;
-      const { matched_by, tests } = matchAdlt(test);
-      const [snapshot, coverage] = await Promise.all([adltSnapshotCheck(), tests.some((t) => t.coverage_topic) ? coverageIndex() : Promise.resolve(null)]);
+      // Sources in order (fleet #2458): the CMS ADLT list, then the MAAA brand
+      // table, then NCBI GTR live. The first that resolves answers; a miss
+      // names every source checked.
+      type Row = { code: string; test_name: string; lab: string; coverage_topic: string | null; code_source: string; adlt?: AdltTest; gtr?: { accession: string; url: string } };
+      const sourcesChecked: string[] = ['CMS ADLT list'];
+      let matched_by: string | null = null;
+      let rows: Row[] = [];
+      let sourceLabel = 'CMS list of Advanced Diagnostic Laboratory Tests (ADLTs) under the Medicare CLFS';
+      const adltHit = matchAdlt(test);
+      if (adltHit.tests.length) {
+        matched_by = adltHit.matched_by;
+        rows = adltHit.tests.map((t) => ({ code: t.code, test_name: t.test_name, lab: t.lab, coverage_topic: t.coverage_topic, code_source: 'CMS ADLT list', adlt: t }));
+      } else {
+        sourcesChecked.push('MAAA brand table (CPT Appendix O pairs backed by MolDX billing articles)');
+        const b = matchTests(BRAND_TESTS, test);
+        if (b.tests.length) {
+          matched_by = b.matched_by;
+          sourceLabel = BRAND_SOURCE;
+          rows = b.tests.map((t) => ({ code: t.code, test_name: t.test_name, lab: t.lab, coverage_topic: t.coverage_topic, code_source: 'MAAA brand table' }));
+        } else {
+          sourcesChecked.push('NCBI Genetic Testing Registry (live)');
+          const g = await gtrLookup(test, ((u: string) => pwFetch(u)) as unknown as typeof fetch);
+          if (g === null) sourcesChecked[sourcesChecked.length - 1] += ' — did not answer';
+          else if (g.length) {
+            matched_by = 'test_name';
+            sourceLabel = 'NCBI Genetic Testing Registry (GTR), code as registered by the performing lab';
+            const seen = new Set<string>();
+            rows = g.filter((h) => !seen.has(h.code + h.lab) && seen.add(h.code + h.lab)).slice(0, 10)
+              .map((h) => ({ code: h.code, test_name: h.test_name, lab: h.lab, coverage_topic: null, code_source: 'NCBI GTR (lab-reported)', gtr: { accession: h.gtr_accession, url: h.url } }));
+          }
+        }
+      }
+      const fromAdlt = rows.some((r) => r.adlt);
+      const [snapshot, coverage] = await Promise.all([
+        fromAdlt || !rows.length ? adltSnapshotCheck() : Promise.resolve({}),
+        rows.some((t) => t.coverage_topic) ? coverageIndex() : Promise.resolve(null),
+      ]);
       const provenance = {
-        source: 'CMS list of Advanced Diagnostic Laboratory Tests (ADLTs) under the Medicare CLFS; rates from the CMS Clinical Laboratory Fee Schedule; policies from the CMS Medicare Coverage Database',
-        source_url: ADLT_SOURCE_URL,
-        data_as_of: ADLT_DATA_AS_OF,
+        source: `${sourceLabel}; rates from the CMS Clinical Laboratory Fee Schedule; policies from the CMS Medicare Coverage Database`,
+        source_url: fromAdlt || !rows.length ? ADLT_SOURCE_URL : rows[0].gtr ? 'https://www.ncbi.nlm.nih.gov/gtr/' : 'https://www.cms.gov/medicare-coverage-database/',
+        data_as_of: fromAdlt || !rows.length ? ADLT_DATA_AS_OF : rows[0].gtr ? new Date().toISOString().slice(0, 10) : BRAND_DATA_AS_OF,
         ...snapshot,
       };
-      if (!tests.length) {
+      if (!rows.length) {
         return {
           found: false,
-          reason: 'not_on_adlt_list',
+          reason: 'brand_not_found',
           test,
-          hint: 'This test is not on CMS\'s ADLT list, which is the only public list that maps a lab test\'s brand name to its billing code. Most PLA codes are not ADLTs; the full PLA code list with proprietary names is published by the AMA under copyright. If you have the code (it usually ends in U, e.g. "0340U"), medicare_lab_rate gives its rate; medicare_lcd_search finds coverage policies by topic.',
+          sources_checked: sourcesChecked,
+          hint: `No billing code found for "${test}" in: ${sourcesChecked.join('; ')}. The full PLA code list with proprietary names is published by the AMA under copyright and is not used here. If you have the code (PLA codes end in U, e.g. "0340U"), medicare_lab_rate gives its rate; medicare_lcd_search finds coverage policies by topic.`,
           ...provenance,
         };
       }
-      const results = await Promise.all(tests.map(async (t: AdltTest) => {
+      const results = await Promise.all(rows.map(async (t) => {
         const rates = await pg<{ year: number; quarter: string; rate: number }>(cfg,
           `clfs_rates?hcpcs=eq.${t.code}&select=year,quarter,rate&order=year.desc,quarter.desc&limit=1`);
         // "Response to Comments" articles are the comment period's record, not policy.
-        const docs = t.coverage_topic && coverage
-          ? coverage.filter((d) => d.title.toLowerCase().includes(t.coverage_topic!.toLowerCase()) && !/^response to comments/i.test(d.title))
+        const topic = t.coverage_topic ? normName(t.coverage_topic) : '';
+        const docs = topic && coverage
+          ? coverage.filter((d) => normName(d.title).includes(topic) && !/^response to comments/i.test(d.title))
           : [];
         const active = docs.filter((d) => !d.retired);
         const retired = docs.filter((d) => d.retired);
+        const a = t.adlt;
         return {
           code: t.code,
-          ...(t.code_note ? { code_note: t.code_note } : {}),
+          ...(a?.code_note ? { code_note: a.code_note } : {}),
           test_name: t.test_name,
           lab: t.lab,
+          code_source: t.code_source,
+          ...(t.gtr ? { gtr: t.gtr } : {}),
           current_clfs_rate: rates.length
             ? { rate_usd: rates[0].rate, fee_schedule_year: rates[0].year, quarter: rates[0].quarter, note: 'National rate; the CLFS is not adjusted by locality.' }
             : { rate_usd: null, note: `${t.code} has no rate on the loaded Clinical Laboratory Fee Schedule (it may be contractor-priced).` },
-          adlt: {
-            approval_date: t.adlt_approval_date,
-            existing_adlt: t.existing_adlt,
-            new_adlt_initial_period: t.new_adlt_initial_period,
-            initial_period_payment_usd: t.initial_period_payment_usd,
-          },
+          adlt: a
+            ? { approval_date: a.adlt_approval_date, existing_adlt: a.existing_adlt, new_adlt_initial_period: a.new_adlt_initial_period, initial_period_payment_usd: a.initial_period_payment_usd }
+            : { is_adlt: false },
           coverage: t.coverage_topic
             ? {
                 policy_topic: t.coverage_topic,
-                topic_note: 'Policies whose title matches this test\'s category (our topic mapping, not CMS\'s). Whether this specific test is listed is stated in the billing article\'s code table.',
+                topic_note: 'Policies whose title matches this test or its category (our topic mapping, not CMS\'s). Whether this specific test is listed is stated in the billing article\'s code table.',
                 active_documents: active.slice(0, 20),
                 active_count: active.length,
                 ...(includeRetired ? { retired_documents: retired.slice(0, 20) } : {}),
                 retired_count: retired.length,
                 ...(coverage === null ? { error: 'CMS Coverage API did not answer; retry, or use medicare_lcd_search with the policy_topic.' } : {}),
               }
-            : { policy_topic: null, note: 'No MolDX local policy title matches this test\'s category; it may be covered nationally (NCD) or case by case.' },
+            : { policy_topic: null, note: 'No MolDX local policy title matched to this test; it may be covered nationally (NCD) or case by case — medicare_lcd_search can look.' },
         };
       }));
       return {
@@ -1194,7 +1232,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         query: test,
         matched_by,
         tests: results,
-        no_descriptors_note: 'The AMA\'s CPT PLA descriptor text is not returned (AMA copyright); the test name and lab are CMS\'s.',
+        sources_checked: sourcesChecked,
+        no_descriptors_note: 'The AMA\'s CPT descriptor text is not returned (AMA copyright); only the code, test name and lab.',
         ...provenance,
       };
     }
