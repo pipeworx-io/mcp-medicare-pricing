@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-medicare-pricing",
-  "version": "0.1.3",
-  "description": "What does Medicare PAY — physician fee schedule, lab rates, and per-day unit",
+  "version": "0.1.4",
+  "description": "What does Medicare PAY — physician fee schedule, lab rates, and per-day unit limits.",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-4bc045e1de966c1a9bd8a24cb7841ad9803cdfe842f2b6db807b64562639bc33",
-    "sourceCommit": "6fe8fb3e01138dfc4ebe7d5c246503aab9278d06"
+    "sourceHash": "v1-65f2f81a2d58d5024e9845e0238d0a24b75f7fa653f412494f5054bb6cfc84dd",
+    "sourceCommit": "514e3efb42b8d81082c07e01d3ae7654bbf91f52"
   }
 }

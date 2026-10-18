@@ -864,6 +864,94 @@ const STATUS: Record<string, string> = {
   X: 'Statutorily excluded from the fee schedule',
 };
 
+// ── FQHC PPS base payment rate (fleet #3241) ──────────────────────────────
+//
+// CMS publishes this ONE number a year, in a CMS Manual System TRANSMITTAL
+// (a "Recurring Update Notification" Change Request PDF) — there is no API
+// and no bulk file, just a yearly PDF with a single new figure in it. A
+// hand-maintained table of a handful of values is the documented shape for
+// that case (house rule for fleet #3241: "a PDF fact sheet with one number
+// per year... a tiny dated table is acceptable"), not a Supabase ingest
+// pipeline for five numbers. Every row below was read directly off its own
+// primary CMS transmittal (not a summary site) — see transmittal/change
+// request/pub per row.
+//
+// REFRESH: CMS issues the next year's transmittal in Nov/Dec for the
+// following Jan 1 (the CY2026 one was dated 2025-12-05) — add a row here
+// each year when it posts. Search "FQHC PPS Calendar Year" among CMS's own
+// transmittals (Pub 100-04 Medicare Claims Processing or Pub 100-02 Medicare
+// Benefit Policy) to find the next one.
+interface FqhcPpsRow {
+  year: number;
+  base_rate_usd: number;
+  effective_date: string;
+  market_basket_update_pct: number;
+  prior_year_rate_usd: number;
+  transmittal: string;
+  change_request: string;
+  publication: string;
+}
+const FQHC_PPS_BASE_RATES: FqhcPpsRow[] = [
+  { year: 2022, base_rate_usd: 180.16, effective_date: '2022-01-01', market_basket_update_pct: 2.1, prior_year_rate_usd: 176.45, transmittal: 'Transmittal 11057', change_request: 'CR 12490', publication: 'Pub 100-04 Medicare Claims Processing' },
+  { year: 2023, base_rate_usd: 187.19, effective_date: '2023-01-01', market_basket_update_pct: 3.9, prior_year_rate_usd: 180.16, transmittal: 'Transmittal 11677', change_request: 'CR 12961', publication: 'Pub 100-04 Medicare Claims Processing' },
+  { year: 2024, base_rate_usd: 195.99, effective_date: '2024-01-01', market_basket_update_pct: 4.7, prior_year_rate_usd: 187.19, transmittal: 'Transmittal 12267', change_request: 'CR 13398', publication: 'Pub 100-04 Medicare Claims Processing' },
+  { year: 2025, base_rate_usd: 202.65, effective_date: '2025-01-01', market_basket_update_pct: 3.4, prior_year_rate_usd: 195.99, transmittal: 'Transmittal 12951', change_request: 'CR 13867', publication: 'Pub 100-04 Medicare Claims Processing' },
+  { year: 2026, base_rate_usd: 207.72, effective_date: '2026-01-01', market_basket_update_pct: 2.5, prior_year_rate_usd: 202.65, transmittal: 'Transmittal 13506', change_request: 'CR 14309', publication: 'Pub 100-02 Medicare Benefit Policy' },
+];
+const FQHC_SOURCE = 'Centers for Medicare & Medicaid Services (CMS), Federally Qualified Health Center (FQHC) Prospective Payment System base payment rate';
+
+function fqhcStatement(r: FqhcPpsRow): string {
+  return `CMS FQHC PPS base payment rate for CY ${r.year}: $${r.base_rate_usd.toFixed(2)}, effective ${r.effective_date} — a ${r.market_basket_update_pct}% FQHC market basket increase over CY ${r.year - 1}'s $${r.prior_year_rate_usd.toFixed(2)} (${r.transmittal}, ${r.change_request}, ${r.publication}). This is the national base rate before any per-FQHC Geographic Adjustment Factor (GAF).`;
+}
+
+function fqhcPpsRate(args: Record<string, unknown>) {
+  const askedYear = typeof args.year === 'number' ? Math.floor(args.year) : null;
+  const rows = FQHC_PPS_BASE_RATES;
+  if (askedYear == null) {
+    const latest = rows[rows.length - 1];
+    return {
+      found: true,
+      source: FQHC_SOURCE,
+      year: latest.year,
+      year_was_defaulted: true,
+      base_rate_usd: latest.base_rate_usd,
+      effective_date: latest.effective_date,
+      market_basket_update_pct: latest.market_basket_update_pct,
+      prior_year_rate_usd: latest.prior_year_rate_usd,
+      transmittal: latest.transmittal,
+      change_request: latest.change_request,
+      publication: latest.publication,
+      statement: fqhcStatement(latest),
+      per_visit_not_per_code: 'This is a per-DAY encounter rate (lesser of actual charges or this PPS rate), not a fee per HCPCS/CPT code.',
+      history: rows,
+    };
+  }
+  const row = rows.find((r) => r.year === askedYear);
+  if (!row) {
+    return {
+      found: false,
+      reason: 'year_not_loaded',
+      loaded_years: rows.map((r) => r.year),
+      hint: `No FQHC PPS base payment rate loaded for CY ${askedYear}. Loaded years: ${rows.map((r) => r.year).join(', ')}.`,
+    };
+  }
+  return {
+    found: true,
+    source: FQHC_SOURCE,
+    year: row.year,
+    year_was_defaulted: false,
+    base_rate_usd: row.base_rate_usd,
+    effective_date: row.effective_date,
+    market_basket_update_pct: row.market_basket_update_pct,
+    prior_year_rate_usd: row.prior_year_rate_usd,
+    transmittal: row.transmittal,
+    change_request: row.change_request,
+    publication: row.publication,
+    statement: fqhcStatement(row),
+    per_visit_not_per_code: 'This is a per-DAY encounter rate (lesser of actual charges or this PPS rate), not a fee per HCPCS/CPT code.',
+  };
+}
+
 const tools: McpToolExport['tools'] = [
   {
     name: 'medicare_physician_payment',
@@ -968,6 +1056,18 @@ const tools: McpToolExport['tools'] = [
     },
   },
   {
+    name: 'medicare_fqhc_pps_rate',
+    description:
+      'What does Medicare pay a Federally Qualified Health Center (FQHC) per visit? Returns the CMS FQHC Prospective Payment System (PPS) national BASE payment rate for a calendar year — the figure CMS publishes once a year, before any per-FQHC Geographic Adjustment Factor (GAF) is applied. Answers "what is the FQHC PPS base rate", "how much does Medicare pay an FQHC per encounter", "FQHC PPS rate for 2025 vs 2026". '
+      + 'Medicare pays an FQHC the LESSER of its actual charges or this PPS rate for all FQHC services furnished to a beneficiary on a day with a qualifying face-to-face visit — it is a per-DAY encounter rate, not a fee per procedure code (unlike medicare_physician_payment/medicare_lab_rate). This tool does NOT compute the GAF-adjusted, FQHC-specific amount — only the national base rate before that adjustment; the GAF table is not loaded here. Omit year for the newest loaded year plus the full known history (small — CMS publishes one number a year); pass year for one row.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        year: { type: 'number', description: 'Calendar year, e.g. 2026. Omit to get the newest loaded year AND the full history table.' },
+      },
+    },
+  },
+  {
     name: 'medicare_pricing_coverage',
     description:
       'What Medicare pricing data is loaded and how current it is: the fee-schedule years and quarters held, how many codes are in each dataset, how many localities, and the PTP pair-edit change window. Use to check a vintage is current enough to quote before relying on a rate, and to see the scope limit on check_code_pair / explain_ncci_edit — they see only pairs that changed within the loaded quarterly window, not the full AMA-licence-gated PTP baseline.',
@@ -1042,6 +1142,12 @@ async function resolveLocality(cfg: Cfg, q: unknown, year: number): Promise<{ ch
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  // FQHC PPS is a hand-maintained constant table (see FQHC_PPS_BASE_RATES
+  // above) — not Supabase-backed like the rest of this pack — so it is
+  // dispatched before the credential check below, which every OTHER tool
+  // here needs.
+  if (name === 'medicare_fqhc_pps_rate') return fqhcPpsRate(args);
+
   const url = (args._supabaseUrl as string | undefined)?.trim();
   const key = (args._supabaseKey as string | undefined)?.trim();
   if (!url || !key) {
@@ -1430,6 +1536,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         geographic_localities: gpciN.length ? { year: gpciN[0].year } : null,
         clinical_lab_fee_schedule: clfsN.length ? { year: clfsN[0].year, quarter: clfsN[0].quarter } : null,
         dmepos_fee_schedule: dmeN.length ? { year: dmeN[0].year, release: dmeN[0].release, release_month: DME_RELEASE_MONTH[dmeN[0].release] ?? null, priced_by: 'state (not Medicare locality), with separate rural/non-rural amounts' } : null,
+        fqhc_pps_base_rate: { newest_loaded_year: FQHC_PPS_BASE_RATES[FQHC_PPS_BASE_RATES.length - 1].year, loaded_years: FQHC_PPS_BASE_RATES.map((r) => r.year), source: FQHC_SOURCE },
         medically_unlikely_edits: mueN.length ? { effective_from: mueN[0].effective_date } : null,
         procedure_to_procedure_edits: ptpRange.length ? {
           baseline_vintage: '2026q3 (v322r0, effective 2026-07-01) — CMS\'s FULL NCCI PTP edit baseline, AMA-CPT-licence-gated; licence accepted on the company\'s behalf by Bruce, 2026-09-07 (fleet #1293)',
@@ -1439,7 +1546,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         refresh_cadence: 'Physician fee schedule annually (with intra-year releases); lab fee schedule, DMEPOS fee schedule, MUE units edits, and PTP pair-edit changes all quarterly (as necessary).',
         no_descriptions_note:
           'CPT procedure descriptions (physician fee schedule, lab schedule) are not returned — American Medical Association copyright. DMEPOS is the exception: it uses HCPCS Level II codes, which CMS itself maintains, so medicare_dmepos_rate DOES return the code description.',
-        source: 'CMS Physician Fee Schedule, Clinical Laboratory Fee Schedule, DMEPOS fee schedule, and National Correct Coding Initiative (MUE + PTP quarterly change files)',
+        source: 'CMS Physician Fee Schedule, Clinical Laboratory Fee Schedule, DMEPOS fee schedule, FQHC PPS base payment rate, and National Correct Coding Initiative (MUE + PTP quarterly change files)',
       };
     }
 

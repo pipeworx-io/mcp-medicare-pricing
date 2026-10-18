@@ -4,7 +4,7 @@ What Medicare **pays** — physician fee schedule, lab rates, and per-day unit
 limits. The companion to `medicare-coverage`, which answers whether something is
 covered but not what it is worth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -17,6 +17,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 | `medicare_code_units_limit` | "How many units of this code will they pay for in one day?" — NCCI MUE. |
 | `check_code_pair` | "Can I bill 00142 and 64474 together?" — NCCI PTP edit + modifier indicator for a code pair. |
 | `explain_ncci_edit` | "What is bundled into (or bundles into) this code?" — every recorded PTP edit for one code. |
+| `medicare_fqhc_pps_rate` | "What is the FQHC PPS base rate for 2026?" — CMS's national Federally Qualified Health Center per-visit base rate, by year. |
 | `medicare_pricing_coverage` | Which vintages are loaded, including the PTP baseline vintage. |
 
 ## Auth
@@ -32,6 +33,31 @@ All from CMS, all downloadable files with no API:
 - **DMEPOS fee schedule** (durable medical equipment, prosthetics, orthotics, supplies) — quarterly (as necessary): A=Jan, B=Apr, C=Jul, D=Oct
 - **NCCI Medically Unlikely Edits** — quarterly
 - **NCCI PTP quarterly additions/deletions/revisions files** — quarterly (see below — a narrower source than the other three)
+- **FQHC Prospective Payment System base payment rate** — annual (see below — a hand-maintained table, not a downloaded file)
+
+## FQHC PPS base payment rate — a hand-maintained table, and why
+
+`medicare_fqhc_pps_rate` is different from the rest of this pack: it is not
+backed by Supabase or a downloaded bulk file, because there is neither. CMS
+publishes the FQHC PPS national base rate exactly once a year, as a single new
+dollar figure inside a CMS Manual System "Recurring Update Notification"
+Change Request PDF — one number, one PDF, once a year. Standing up an ingest
+pipeline for that is not proportionate, so the pack carries a small table of
+`{year, base_rate_usd, effective_date, market_basket_update_pct,
+prior_year_rate_usd, transmittal, change_request, publication}` in
+`src/index.ts` (`FQHC_PPS_BASE_RATES`), five rows (CY2022–CY2026), each read
+directly off its own primary CMS transmittal.
+
+This is the national BASE rate only — before the per-FQHC Geographic
+Adjustment Factor (GAF) CMS applies on top. The GAF table itself is not
+loaded; an agent that needs the GAF-adjusted dollar amount for a specific FQHC
+still needs that separately.
+
+**Refresh**: CMS issues the following year's transmittal in Nov/Dec (the
+CY2026 update was dated 2025-12-05 for a Jan 1, 2026 effective date). Add a
+row to `FQHC_PPS_BASE_RATES` each year once it posts — search CMS's own
+transmittals (Pub 100-04 Medicare Claims Processing, or Pub 100-02 Medicare
+Benefit Policy) for "FQHC PPS Calendar Year".
 
 ## ADLT list — brand name to billing code
 
@@ -311,7 +337,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1831+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
