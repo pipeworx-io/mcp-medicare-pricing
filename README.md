@@ -4,7 +4,7 @@ What Medicare **pays** — physician fee schedule, lab rates, and per-day unit
 limits. The companion to `medicare-coverage`, which answers whether something is
 covered but not what it is worth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -14,6 +14,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 | `medicare_lab_rate` | "What does a comprehensive metabolic panel reimburse?" — national CLFS rate. |
 | `medicare_lab_test_lookup` | "What does Medicare pay for Signatera, and which MolDX LCD applies?" — brand name → PLA code, current CLFS rate, and the MolDX LCDs/articles for the test's category. |
 | `medicare_dmepos_rate` | "How much does Medicare pay for a CPAP machine (E0601) in Texas?" — state-priced, rural vs non-rural. |
+| `medicare_opps_rate` | "What does Medicare pay a hospital outpatient department for CPT 33289 (CardioMEMS implant)?" — status indicator, APC, relative weight, national payment rate, copay, device/drug pass-through status. |
 | `medicare_code_units_limit` | "How many units of this code will they pay for in one day?" — NCCI MUE. |
 | `check_code_pair` | "Can I bill 00142 and 64474 together?" — NCCI PTP edit + modifier indicator for a code pair. |
 | `explain_ncci_edit` | "What is bundled into (or bundles into) this code?" — every recorded PTP edit for one code. |
@@ -31,6 +32,7 @@ All from CMS, all downloadable files with no API:
 - **Physician Fee Schedule relative value files** (RVUs + GPCIs) — annual
 - **Clinical Laboratory Fee Schedule** — quarterly
 - **DMEPOS fee schedule** (durable medical equipment, prosthetics, orthotics, supplies) — quarterly (as necessary): A=Jan, B=Apr, C=Jul, D=Oct
+- **OPPS Addendum B** (Hospital Outpatient Prospective Payment System payment rates by HCPCS code) — quarterly: Q1=Jan, Q2=Apr, Q3=Jul, Q4=Oct
 - **NCCI Medically Unlikely Edits** — quarterly
 - **NCCI PTP quarterly additions/deletions/revisions files** — quarterly (see below — a narrower source than the other three)
 - **FQHC Prospective Payment System base payment rate** — annual (see below — a hand-maintained table, not a downloaded file)
@@ -49,9 +51,20 @@ prior_year_rate_usd, transmittal, change_request, publication}` in
 directly off its own primary CMS transmittal.
 
 This is the national BASE rate only — before the per-FQHC Geographic
-Adjustment Factor (GAF) CMS applies on top. The GAF table itself is not
-loaded; an agent that needs the GAF-adjusted dollar amount for a specific FQHC
-still needs that separately.
+Adjustment Factor (GAF) CMS applies on top. The GAF-adjusted amount for a
+locality is `medicare_fqhc_gaf` (below).
+
+## Geographic adjustment: `medicare_gpci_lookup` and `medicare_fqhc_gaf` (fleet #3398)
+
+`medicare_gpci_lookup` returns the work / practice-expense / malpractice GPCIs
+for a locality or a whole state with no procedure code (years 2024-2026 loaded;
+2024 and 2025 were backfilled with `scripts/ingest-medicare-pricing.mjs
+--gpci-only`). `medicare_fqhc_gaf` returns CMS's own published FQHC GAF per
+locality for CY2024-2026 and the GAF-adjusted per-visit rate. The GAF table is
+CMS's published number, not derived here, and is a small generated source file
+(`src/fqhc-gaf.ts`, 109 localities per year). **Refresh** each January: download
+the new year's FQHC GAF file from CMS and run
+`node scripts/build-fqhc-gaf-table.mjs 2024=<csv> 2025=<csv> 2026=<csv> 2027=<csv>`.
 
 **Refresh**: CMS issues the following year's transmittal in Nov/Dec (the
 CY2026 update was dated 2025-12-05 for a Jan 1, 2026 effective date). Add a
@@ -237,6 +250,48 @@ which is AMA copyright. The DMEPOS source file's own DMEREAD/DMEBACK
 documentation carries no AMA/copyright notice anywhere (checked), so
 `medicare_dmepos_rate` DOES return the code description.
 
+## OPPS — what a hospital outpatient department is paid
+
+`medicare_opps_rate` answers the same "what does Medicare pay" question for a
+**hospital outpatient department** claim, as opposed to a physician office
+(`medicare_physician_payment`) or a lab (`medicare_lab_rate`). Source: CMS,
+OPPS Addendum B, the quarterly national payment-rate file by HCPCS code.
+Measured size: 19,278 rows for the CY2026 October release — small, loaded
+whole, same shape as `clfs_rates`/`dmepos_rates` already in this pack.
+
+**Device and drug/biological pass-through is the status indicator, not a
+separate column.** CMS's own "Drug and Device Pass-Through Expiration during
+Calendar Year" column in Addendum B is, in practice, not a usable date field —
+checked against the CY2026 October release, every non-blank value in that
+column was a stray change-marker rather than a date. The reliable signal is
+the status indicator itself: **SI='H'** is a pass-through device category
+(paid separately, outside the standard APC amount, for as long as the device
+holds that status — typically 2-3 years from market entry, after which CMS
+reprices it, often to packaged SI='N'), and **SI='G'** is a pass-through
+drug/biological. `device_pass_through`/`drug_or_biological_pass_through` on
+every response are derived from SI, not from the expiration column.
+
+A **packaged** code (SI='N', among several other status indicators) returns a
+valid `status_indicator` and `status_indicator_meaning` but `apc: null` and no
+payment rate — that is a correct, normal answer: OPPS pays for that code only
+as part of whatever procedure it is billed alongside, never on its own.
+CardioMEMS (C2624, the implantable pulmonary-artery pressure sensor) is a
+worked example of exactly this: it has been on the market long enough that it
+is no longer pass-through (SI='N', packaged into the implant procedure
+33289's payment), which is the expected, current state — not a missing-data
+gap.
+
+## No OPPS short descriptors — a mixed-code-type file
+
+Addendum B's own header states *"CPT codes and descriptions only are
+copyright ... American Medical Association"*, and the file mixes AMA-
+copyright CPT (HCPCS Level I, numeric codes like 33289) with CMS-owned HCPCS
+Level II codes (like C2624) under **one shared** descriptor column, with no
+per-row schema signal to tell which is which. Unlike `medicare_dmepos_rate`
+(Level II only, so the description is safely CMS-owned), `medicare_opps_rate`
+follows the stricter `pfs_rvu` convention instead: no descriptor is stored at
+all, for any code in this table. A caller passes a code they already hold.
+
 ## DMEPOS pays by state, not locality
 
 Medicare pays DMEPOS by **state** (not by the physician-fee-schedule
@@ -271,14 +326,29 @@ node scripts/ingest-ncci-ptp-baseline.mjs --dir /path/to/8-zips  # full PTP base
 
 node scripts/ingest-dmepos.mjs                                # newest DMEPOS release (default: 2026 release C)
 node scripts/ingest-dmepos.mjs --year 2026 --release D         # add a new release when CMS posts one
+
+node scripts/ingest-opps.mjs                                   # newest OPPS Addendum B release (default: 2026 October)
+node scripts/ingest-opps.mjs --year 2026 --month january       # add a new quarterly release when CMS posts one
 ```
 
 Loaded as of writing: 19,226 RVU rows, 109 localities, 2,081 lab rates, 3,531
-DMEPOS code/modifier rows (2026 release C, 53 states/territories each), 33,354
+DMEPOS code/modifier rows (2026 release C, 53 states/territories each), 19,278
+OPPS Addendum B rows (CY2026 October / Q4), 33,354
 MUEs, **4,109,749 distinct NCCI PTP pairs** — the FULL CMS baseline (2026q3,
 v322r0) with the 2025q1..2026q3 quarterly change files layered on top (fleet
 #1293, 2026-09-07; superseded the prior 182,286-pair change-window-only
 coverage). All loaders refuse rather than reporting an empty parse as success.
+
+`ingest-opps.mjs` resolves the current download from the OPPS Addendum B
+release landing page, same pattern as `ingest-dmepos.mjs`. The landing page's
+own link routes through CMS's `/apps/ama/license.asp?file=...` AMA licence
+click-through page — but, unlike the NCCI PTP baseline elsewhere in this pack,
+the underlying file is NOT actually gated: fetching the plain
+`https://www.cms.gov/files/zip/<name>.zip` URL directly (bypassing
+license.asp entirely) returns the zip with no click-through, no cookie, and no
+Referer needed — verified live, 2026-10-21. The script extracts that direct
+URL from the landing page and fetches it, rather than going through
+license.asp at all.
 
 `ingest-dmepos.mjs` resolves the current download from the DMEPOS release
 subpage rather than guessing the zip filename — CMS's DMEPOS naming is not
@@ -337,7 +407,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1831+ data sources. The
+Both URLs reach the same gateway and the same 1882+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +686,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * What does Medicare PAY — physician fee schedule, lab rates, and per-day unit
  * limits.
@@ -737,9 +1001,26 @@ function collapse(s: string): string {
  * year AND release (quarterly-ish: A=Jan primary annual update, B=Apr, C=Jul,
  * D=Oct as needed) are stated on every response, and an unloaded year/release
  * returns year_not_loaded rather than silently substituting another vintage.
+ *
+ * OPPS (Hospital Outpatient Prospective Payment System) is the sixth data
+ * source, added for fleet task #3430 — what Medicare pays a HOSPITAL
+ * OUTPATIENT department (as opposed to a physician office, a lab, or a
+ * supplier) per HCPCS code: status indicator, Ambulatory Payment
+ * Classification (APC), relative weight, national payment rate, and
+ * beneficiary copayment, from CMS's quarterly OPPS Addendum B. Like pfs_rvu,
+ * NO code descriptor is stored — Addendum B mixes AMA-copyright CPT codes
+ * with CMS-owned HCPCS Level II codes under one shared descriptor column
+ * with no per-row way to separate them, so none is kept. Device and drug/
+ * biological PASS-THROUGH status (a separate, outside-the-APC payment while
+ * a new device or drug holds that status) is derived from the status
+ * indicator itself (SI='H' device, SI='G' drug/biological) rather than from
+ * CMS's own "pass-through expiration" column, which is unreliable in
+ * practice. Vintage is calendar-quarter (Q1=Jan, Q2=Apr, Q3=Jul, Q4=Oct),
+ * stated on every response.
  */
 
 import { ADLT_DATA_AS_OF, ADLT_SOURCE_URL, SNAPSHOT_LAST_MODIFIED, matchAdlt, type AdltTest } from './adlt.js';
+import { FQHC_GAF_ROWS } from './fqhc-gaf.js';
 import { BRAND_DATA_AS_OF, BRAND_SOURCE, BRAND_TESTS, gtrLookup, matchTests, norm as normName } from './brand-codes.js';
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
@@ -784,6 +1065,14 @@ interface Gpci {
 interface PtpEdit {
   service_type: string; column1: string; column2: string; modifier_indicator: string;
   status: string; effective_date: string; first_seen_quarter: string; last_seen_quarter: string;
+}
+interface OppsRow {
+  year: number; quarter: string; hcpcs: string; status_indicator: string; apc: string | null;
+  relative_weight: number | null; payment_rate_usd: number | null;
+  national_unadjusted_copay_usd: number | null; minimum_unadjusted_copay_usd: number | null;
+  ira_coinsurance_pct: number | null; adjusted_beneficiary_copay_usd: number | null;
+  device_pass_through: boolean; drug_or_biological_pass_through: boolean;
+  note: string | null; changed_this_release: boolean;
 }
 
 const PTP_WINDOW_NOTE = 'ncci_ptp_edits holds the FULL NCCI PTP baseline (2026q3, v322r0, effective 2026-07-01) with the 2025q1..2026q3 quarterly change files layered on top — see medicare_pricing_coverage for the loaded vintage.';
@@ -838,6 +1127,20 @@ function resolveState(q: unknown): { abbr: string | null; note: string } {
   if (byName) return { abbr: byName, note: `Resolved "${t}" to ${byName}.` };
   return { abbr: null, note: `"${t}" is not a recognized US state, DC, or territory (PR/VI). Pass a 2-letter code or full name.` };
 }
+// OPPS releases are quarterly and calendar-aligned (Q1=Jan, Q2=Apr, Q3=Jul,
+// Q4=Oct) — accept a bare quarter ("Q3"/"3") or the month CMS actually names
+// its release after ("july"/"jul"), since callers are more likely to know
+// the month a code's rate changed than CMS's internal quarter label.
+const QUARTER_ALIASES: Record<string, string> = {
+  q1: 'Q1', '1': 'Q1', jan: 'Q1', january: 'Q1',
+  q2: 'Q2', '2': 'Q2', apr: 'Q2', april: 'Q2',
+  q3: 'Q3', '3': 'Q3', jul: 'Q3', july: 'Q3',
+  q4: 'Q4', '4': 'Q4', oct: 'Q4', october: 'Q4',
+};
+function resolveQuarter(q: unknown): string | null {
+  if (typeof q !== 'string' || !q.trim()) return null;
+  return QUARTER_ALIASES[q.trim().toLowerCase()] ?? null;
+}
 const DME_CATEGORY: Record<string, string> = {
   IN: 'Inexpensive and Other Routinely Purchased Items', FS: 'Frequently Serviced Items',
   CR: 'Capped Rental Items', OX: 'Oxygen and Oxygen Equipment',
@@ -862,6 +1165,43 @@ const STATUS: Record<string, string> = {
   R: 'Restricted coverage — special circumstances only',
   T: 'Paid only when no other separately payable service is billed on the same day',
   X: 'Statutorily excluded from the fee schedule',
+};
+
+// ── OPPS (Hospital Outpatient Prospective Payment System) ────────────────
+// CMS's own status-indicator legend, stable across years. H and G are the
+// two that carry PASS-THROUGH status (a separate payment outside the
+// standard APC amount while a new device/drug holds it) — device_pass_through
+// and drug_or_biological_pass_through on medicare_opps_rate are derived from
+// these two codes rather than from CMS's own "pass-through expiration" date
+// column, which the loaded release does not reliably populate.
+const OPPS_SI: Record<string, string> = {
+  A: 'Paid under a fee schedule or payment system other than OPPS — not a hospital outpatient payment.',
+  B: 'Not recognized by OPPS on an outpatient claim; another code reports this service.',
+  C: 'Inpatient procedure — not paid under OPPS when billed as outpatient.',
+  D: 'Discontinued code.',
+  E1: 'Not covered by any Medicare outpatient benefit category — not paid under OPPS.',
+  E2: 'No pricing information or claims data available — not paid under OPPS.',
+  F: 'Corneal tissue acquisition, certain CRNA services, or hepatitis B vaccine — paid at reasonable cost, not subject to deductible or coinsurance.',
+  G: 'PASS-THROUGH drug or biological — paid separately, outside the standard APC amount, while it holds pass-through status.',
+  H: 'PASS-THROUGH device category — paid separately, outside the standard APC amount, while the device holds pass-through status.',
+  J1: 'Hospital Part B service paid through a comprehensive APC — packaged with everything else on the claim into one payment.',
+  J2: 'Hospital Part B service that may be paid through a comprehensive APC, depending on what else is billed the same day.',
+  K: 'Non-pass-through drug, biological, or therapeutic radiopharmaceutical — paid separately under OPPS.',
+  L: 'Influenza or pneumococcal pneumonia vaccine — paid at reasonable cost, not subject to deductible or coinsurance.',
+  M: 'Not billable to the Medicare Administrative Contractor under this benefit.',
+  N: 'Packaged into the APC payment for the primary service on the claim — no separate OPPS payment for this code.',
+  P: 'Partial hospitalization.',
+  Q1: 'Conditionally packaged ("STV-packaged") — separately payable only when no other type-S/T/V service is on the same claim.',
+  Q2: 'Conditionally packaged ("T-packaged") — separately payable only when no type-T service is on the same claim.',
+  Q3: 'May be paid through a composite APC with certain other codes billed the same day.',
+  Q4: 'Conditionally packaged laboratory test.',
+  R: 'Blood or blood product — paid separately under OPPS.',
+  S: 'Procedure or service paid separately under OPPS, not subject to multiple-procedure discounting.',
+  T: 'Procedure or service paid separately under OPPS, subject to multiple-procedure discounting when billed with another T-status code the same day.',
+  U: 'Brachytherapy source — paid separately under OPPS.',
+  V: 'Clinic or emergency department visit — paid separately under OPPS.',
+  X: 'Ancillary service — paid separately under OPPS.',
+  Y: 'Non-implantable durable medical equipment — statutorily non-covered on this claim type.',
 };
 
 // ── FQHC PPS base payment rate (fleet #3241) ──────────────────────────────
@@ -1013,6 +1353,21 @@ const tools: McpToolExport['tools'] = [
     },
   },
   {
+    name: 'medicare_opps_rate',
+    description:
+      'What does Medicare pay a HOSPITAL OUTPATIENT department for a procedure, device, or drug code? Returns the status indicator, Ambulatory Payment Classification (APC), relative weight, national payment rate, and beneficiary copayment for a HCPCS/CPT code under the Hospital Outpatient Prospective Payment System (OPPS) — the schedule that applies when the same service is billed by a hospital\'s outpatient department rather than a physician office (medicare_physician_payment) or a lab (medicare_lab_rate). Answers "what does Medicare pay for CPT 33289 in a hospital outpatient setting", "what is the APC for C2624", "is this device on pass-through status", "what is the OPPS payment rate and copay for this code". '
+      + 'Flags device_pass_through and drug_or_biological_pass_through — whether the code is CURRENTLY in a CMS pass-through category (status indicator H or G), meaning it is paid separately, outside the normal APC amount, rather than packaged into the procedure it goes with. A packaged code (status indicator N, among others) still has a valid status_indicator but no apc/payment_rate_usd, because OPPS pays for it only as part of whatever procedure it is billed with — that is a normal result, not a missing one. States the fee-schedule YEAR and QUARTER (Q1=Jan, Q2=Apr, Q3=Jul, Q4=Oct) used on every response. Sourced from CMS, OPPS Addendum B.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: { type: 'string', description: 'HCPCS or CPT code, e.g. "33289" (CardioMEMS implant procedure) or "C2624" (implantable wireless pulmonary artery pressure sensor).' },
+        year: { type: 'number', description: 'Calendar year, e.g. 2026. Omit to use the newest loaded year, which is stated in the response.' },
+        quarter: { type: 'string', description: 'Which quarterly release: "Q1".."Q4", or the release month CMS actually uses ("january"/"april"/"july"/"october"). Omit to use the newest loaded quarter for the resolved year.' },
+      },
+      required: ['code'],
+    },
+  },
+  {
     name: 'medicare_code_units_limit',
     description:
       'How many units of a procedure code will Medicare pay for one patient in one day? Returns the NCCI Medically Unlikely Edit (MUE) — the maximum units allowed — with the adjudication indicator saying whether the limit is absolute or can be overridden with documentation, and the rationale for it. Answers "what is the MUE for 99213", "how many units of this code can I bill", "why was my claim denied for units". Available for practitioner, outpatient hospital and DME settings, which have different limits for the same code. States the quarterly edit vintage in force. Sourced from the CMS National Correct Coding Initiative.',
@@ -1059,11 +1414,40 @@ const tools: McpToolExport['tools'] = [
     name: 'medicare_fqhc_pps_rate',
     description:
       'What does Medicare pay a Federally Qualified Health Center (FQHC) per visit? Returns the CMS FQHC Prospective Payment System (PPS) national BASE payment rate for a calendar year — the figure CMS publishes once a year, before any per-FQHC Geographic Adjustment Factor (GAF) is applied. Answers "what is the FQHC PPS base rate", "how much does Medicare pay an FQHC per encounter", "FQHC PPS rate for 2025 vs 2026". '
-      + 'Medicare pays an FQHC the LESSER of its actual charges or this PPS rate for all FQHC services furnished to a beneficiary on a day with a qualifying face-to-face visit — it is a per-DAY encounter rate, not a fee per procedure code (unlike medicare_physician_payment/medicare_lab_rate). This tool does NOT compute the GAF-adjusted, FQHC-specific amount — only the national base rate before that adjustment; the GAF table is not loaded here. Omit year for the newest loaded year plus the full known history (small — CMS publishes one number a year); pass year for one row.',
+      + 'Medicare pays an FQHC the LESSER of its actual charges or this PPS rate for all FQHC services furnished to a beneficiary on a day with a qualifying face-to-face visit — it is a per-DAY encounter rate, not a fee per procedure code (unlike medicare_physician_payment/medicare_lab_rate). This tool returns only the national base rate before the geographic adjustment; for the GAF-adjusted amount in a named locality use medicare_fqhc_gaf. Omit year for the newest loaded year plus the full known history (small — CMS publishes one number a year); pass year for one row.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         year: { type: 'number', description: 'Calendar year, e.g. 2026. Omit to get the newest loaded year AND the full history table.' },
+      },
+    },
+  },
+  {
+    name: 'medicare_gpci_lookup',
+    description:
+      'What are the Medicare geographic adjustment indices (GPCIs) for a place — with NO procedure code needed? Returns the work, practice-expense and malpractice GPCI for a Medicare payment locality (or every locality in a state), for a calendar year. Answers "GPCI for Rest of Florida locality 99", "Medicare geographic practice cost index for San Francisco", "work GPCI Manhattan 2025", "which Medicare localities does California have". '
+      + 'Medicare pays by LOCALITY, not state (California has nine), so a state or ambiguous name returns every matching locality rather than one chosen quietly, and the resolution is stated. The work GPCI is the floored value CMS pays on (1.0 floor where it applies). Pass state ("FL" or "Florida"), a locality name ("Bakersfield"), and/or locality_number ("99"); year defaults to the newest loaded and is stated. For the FQHC-specific adjustment see medicare_fqhc_gaf; for a dollar payment see medicare_physician_payment. Sourced from the CMS Physician Fee Schedule geographic practice cost indices.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        locality: { type: 'string', description: 'State code ("FL"), state name ("Florida"), or Medicare locality name ("Bakersfield", "Manhattan", "Rest of Florida").' },
+        state: { type: 'string', description: 'Optional state code or name; combine with locality_number to pin one locality.' },
+        locality_number: { type: 'string', description: 'Optional Medicare locality number, e.g. "99" (Rest of Florida) — needs state or locality to say which state.' },
+        year: { type: 'number', description: 'Calendar year, e.g. 2025. Omit for the newest loaded year (stated in the response).' },
+      },
+    },
+  },
+  {
+    name: 'medicare_fqhc_gaf',
+    description:
+      'What is the FQHC Geographic Adjustment Factor (GAF) for a place, and what does Medicare pay a Federally Qualified Health Center per visit THERE? Returns the official CMS FQHC PPS GAF for a Medicare locality and calendar year, and the GAF-adjusted per-visit rate (national base rate x GAF). Answers "FQHC PPS GAF for Orlando, Florida 2025", "CY2026 FQHC geographic adjustment Rest of California", "what is the FQHC PPS rate in Alaska". '
+      + 'The GAF is CMS\'s own published number per locality (adapted from the work and practice-expense GPCIs, with the 1.0 floor), not something this tool estimates. A state returns all its localities; a city is not a locality, so name the locality or pick from the list (Florida has Fort Lauderdale, Miami and Rest of Florida). Complements medicare_fqhc_pps_rate (national base rate) and medicare_gpci_lookup (the underlying GPCIs). Years 2024-2026 loaded. Sourced from the CMS FQHC PPS geographic adjustment factor tables.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        locality: { type: 'string', description: 'State code ("FL"), state name ("Florida"), or Medicare locality name ("Fort Lauderdale", "Rest of Florida"). A bare state returns all of its localities.' },
+        locality_number: { type: 'string', description: 'Optional Medicare locality number, e.g. "99"; with a state it pins one locality.' },
+        year: { type: 'number', description: 'Calendar year, 2024-2026. Omit for the newest loaded year (stated in the response).' },
       },
     },
   },
@@ -1141,12 +1525,154 @@ async function resolveLocality(cfg: Cfg, q: unknown, year: number): Promise<{ ch
   return { chosen, alternatives: others, note };
 }
 
+
+const GPCI_SOURCE = 'CMS, Physician Fee Schedule geographic practice cost indices (GPCIs) by Medicare locality';
+const FQHC_GAF_SOURCE = 'CMS, FQHC Prospective Payment System geographic adjustment factors by Medicare locality (with 1.0 floor)';
+
+/** Split a free-text place into {state?, nameQuery?}. A bare state matches the whole state. */
+function placeQuery(locality: unknown, state: unknown): { abbr: string | null; name: string | null } {
+  let l = typeof locality === 'string' ? locality.trim() : '';
+  let st = typeof state === 'string' ? state.trim() : '';
+  // "Orlando, Florida" / "Orlando, FL": the part after the last comma is the state.
+  const comma = l.lastIndexOf(',');
+  if (comma > 0 && !st) { st = l.slice(comma + 1).trim(); l = l.slice(0, comma).trim(); }
+  const asState = (t: string) => {
+    if (!t) return null;
+    const u = t.toUpperCase();
+    if (VALID_STATE_ABBRS.has(u)) return u;
+    return STATE_NAME_TO_ABBR[t.toLowerCase()] ?? null;
+  };
+  const stAbbr = asState(st);
+  const lAbbr = asState(l);
+  if (stAbbr) return { abbr: stAbbr, name: lAbbr ? null : (l || null) };
+  if (lAbbr) return { abbr: lAbbr, name: null };
+  return { abbr: null, name: l || null };
+}
+
+function fqhcGafLookup(args: Record<string, unknown>) {
+  const years = [...new Set(FQHC_GAF_ROWS.map((r) => r[0]))].sort();
+  const askedYear = typeof args.year === 'number' ? Math.floor(args.year) : null;
+  if (askedYear !== null && !years.includes(askedYear)) {
+    return { found: false, reason: 'year_not_loaded', loaded_years: years, hint: `No FQHC GAF table is loaded for ${askedYear}; loaded years: ${years.join(', ')}. GAFs change every year, so another year's value is not substituted.` };
+  }
+  const year = askedYear ?? years[years.length - 1];
+  const { abbr, name } = placeQuery(args.locality, args.state);
+  const num = typeof args.locality_number === 'string' ? args.locality_number.trim().replace(/^0+(?=\d)/, '') : '';
+  if (!abbr && !name) return { found: false, reason: 'no_place', hint: 'Pass locality (state code/name or a Medicare locality name), e.g. {"locality":"Florida","year":2025}.' };
+  let rows = FQHC_GAF_ROWS.filter((r) => r[0] === year);
+  if (abbr) rows = rows.filter((r) => r[1] === abbr);
+  let cityNote = '';
+  if (name) {
+    const n = name.toLowerCase();
+    const named = rows.filter((r) => r[3].toLowerCase().includes(n));
+    if (!named.length && abbr && rows.length) cityNote = `"${name}" is not a Medicare locality name, so every ${abbr} locality is listed — CMS assigns a city to a locality by county; pick the one that contains it. `;
+    else rows = named;
+  }
+  if (num) rows = rows.filter((r) => r[2].replace(/^0+(?=\d)/, '') === num);
+  if (!rows.length) {
+    return { found: false, reason: 'no_locality_match', year, hint: `No Medicare locality matched ${JSON.stringify(args.locality ?? args.state)}${num ? ` number ${num}` : ''} in ${year}. Pass a state ("FL") to list its localities; a city is not a locality.` };
+  }
+  const base = FQHC_PPS_BASE_RATES.find((r) => r.year === year) ?? null;
+  const localities = rows.map((r) => ({
+    state: r[1], locality_number: r[2], locality_name: r[3], fqhc_gaf: r[4],
+    gaf_adjusted_rate_usd: base ? round2(base.base_rate_usd * r[4]) : null,
+  }));
+  return {
+    found: true,
+    year,
+    year_was_defaulted: askedYear === null,
+    localities,
+    locality_count: localities.length,
+    base_rate_usd: base?.base_rate_usd ?? null,
+    formula: base ? `FQHC PPS base rate $${base.base_rate_usd.toFixed(2)} x FQHC GAF = per-visit rate (before the new-patient / IPPE / AWV add-on and the lesser-of-charges rule)` : null,
+    note: localities.length > 1
+      ? `${cityNote}${localities.length} Medicare localities matched and their GAFs differ; a city is not a locality — pick the locality that contains the health center.`
+      : `Resolved to ${localities[0].locality_name} (${localities[0].state}, locality ${localities[0].locality_number}).`,
+    source: FQHC_GAF_SOURCE,
+    data_as_of: `CY ${year}`,
+    loaded_years: years,
+  };
+}
+
+async function gpciLookup(cfg: Cfg, args: Record<string, unknown>) {
+  const loaded = await pg<{ year: number }>(cfg, 'pfs_gpci?select=year&order=year.desc&limit=1000');
+  const years = [...new Set(loaded.map((r) => r.year))].sort();
+  const askedYear = typeof args.year === 'number' ? Math.floor(args.year) : null;
+  if (askedYear !== null && !years.includes(askedYear)) {
+    return { found: false, reason: 'year_not_loaded', loaded_years: years, hint: `No GPCI table is loaded for ${askedYear}; loaded years: ${years.join(', ')}. GPCIs change every year, so another year's value is not substituted.` };
+  }
+  const year = askedYear ?? years[years.length - 1];
+  const { abbr, name } = placeQuery(args.locality, args.state);
+  const num = typeof args.locality_number === 'string' ? args.locality_number.trim() : '';
+  if (!abbr && !name) return { found: false, reason: 'no_place', hint: 'Pass locality (state code/name or a Medicare locality name), e.g. {"locality":"Florida","year":2025}.' };
+  let rows: Gpci[];
+  let cityNote = '';
+  // fleet #3475: every row carries HOW it matched, and the order is decided here
+  // (rank, then locality_number), not inherited from the RPC's similarity sort.
+  //   state    - the query named a state, this is one of its localities
+  //   exact    - the locality name equals the query
+  //   contains - the locality name contains the query
+  //   similar  - trigram-similar only (e.g. "REST OF MAINE" for "Rest of Florida")
+  type Match = 'exact' | 'state' | 'contains' | 'similar';
+  const matchOf = new Map<Gpci, Match>();
+  if (abbr) {
+    rows = await pg<Gpci>(cfg, `pfs_gpci?year=eq.${year}&state=eq.${abbr}&select=*&order=locality_number.asc&limit=100`);
+    if (name) {
+      const n = name.toLowerCase();
+      const named = rows.filter((r) => r.locality_name.toLowerCase().includes(n));
+      if (!named.length && rows.length) { cityNote = `"${name}" is not a Medicare locality name, so every ${abbr} locality is listed — CMS assigns a city to a locality by county; pick the one that contains it. `; rows.forEach((r) => matchOf.set(r, 'state')); }
+      else { rows = named; rows.forEach((r) => matchOf.set(r, r.locality_name.toLowerCase() === n ? 'exact' : 'contains')); }
+    } else rows.forEach((r) => matchOf.set(r, 'state'));
+  } else {
+    rows = await rpc<Gpci>(cfg, 'resolve_medicare_locality', { q: name, yr: year });
+    const n = (name ?? '').trim().toLowerCase();
+    rows.forEach((r) => {
+      const ln = r.locality_name.toLowerCase();
+      matchOf.set(r, ln === n ? 'exact' : ln.includes(n) ? 'contains' : 'similar');
+    });
+  }
+  if (num) rows = rows.filter((r) => r.locality_number.replace(/^0+(?=\d)/, '') === num.replace(/^0+(?=\d)/, ''));
+  if (!rows.length) return { found: false, reason: 'no_locality_match', year, hint: `No Medicare locality matched ${JSON.stringify(args.locality ?? args.state)}${num ? ` number ${num}` : ''} in ${year}. Pass a state ("FL") to list its localities.` };
+  const rank: Record<Match, number> = { exact: 0, state: 0, contains: 1, similar: 2 };
+  rows = [...rows].sort((a, b) => rank[matchOf.get(a)!] - rank[matchOf.get(b)!] || a.state.localeCompare(b.state) || a.locality_number.localeCompare(b.locality_number));
+  const shape = (r: Gpci) => ({
+    state: r.state, locality_number: r.locality_number, locality_name: r.locality_name,
+    match: matchOf.get(r)!,
+    work_gpci: r.pw_gpci, practice_expense_gpci: r.pe_gpci, malpractice_gpci: r.mp_gpci,
+  });
+  // Near-matches are split out only when something matched the query by name:
+  // a caller who named a locality gets that locality in `localities`, and the
+  // trigram-similar neighbours under a separate key where they cannot be mistaken
+  // for it. With no name match at all, similar rows stay in `localities`, labelled.
+  const strong = rows.filter((r) => matchOf.get(r) !== 'similar');
+  const localities = (strong.length ? strong : rows).slice(0, 40).map(shape);
+  const nearMatches = strong.length ? rows.filter((r) => matchOf.get(r) === 'similar').slice(0, 40).map(shape) : [];
+  return {
+    found: true,
+    year,
+    year_was_defaulted: askedYear === null,
+    localities,
+    locality_count: localities.length,
+    near_matches: nearMatches,
+    near_match_count: nearMatches.length,
+    match_note: 'Each row carries `match`: exact (name equals the query), state (a locality of the state named), contains (name contains the query), similar (spelling-similar only, NOT the place asked for). `near_matches`, when present, holds spelling-similar localities from other places; do not use them as the answer. Rows are ordered exact/state, then contains, then similar, deterministically.',
+    note: localities.length > 1
+      ? `${cityNote}${localities.length} Medicare localities matched and they differ; name a locality or pass locality_number to pin one.`
+      : `Resolved to ${localities[0].locality_name} (${localities[0].state}, locality ${localities[0].locality_number}).`,
+    work_gpci_note: 'Work GPCI is the value CMS pays on, including the 1.0 floor where legislated for the year.',
+    source: GPCI_SOURCE,
+    data_as_of: `CY ${year}`,
+    loaded_years: years,
+  };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   // FQHC PPS is a hand-maintained constant table (see FQHC_PPS_BASE_RATES
   // above) — not Supabase-backed like the rest of this pack — so it is
   // dispatched before the credential check below, which every OTHER tool
   // here needs.
   if (name === 'medicare_fqhc_pps_rate') return fqhcPpsRate(args);
+  if (name === 'medicare_fqhc_gaf') return fqhcGafLookup(args);
 
   const url = (args._supabaseUrl as string | undefined)?.trim();
   const key = (args._supabaseKey as string | undefined)?.trim();
@@ -1156,6 +1682,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const cfg: Cfg = { url, key };
 
   switch (name) {
+    case 'medicare_gpci_lookup':
+      return gpciLookup(cfg, args);
+
     case 'medicare_physician_payment': {
       const hcpcs = code(args.code);
       if (!hcpcs) return { found: false, reason: 'no_code', hint: 'Pass code, e.g. "99213".' };
@@ -1407,6 +1936,65 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       };
     }
 
+    case 'medicare_opps_rate': {
+      const hcpcs = code(args.code);
+      if (!hcpcs) return { found: false, reason: 'no_code', hint: 'Pass code, e.g. "33289" or "C2624".' };
+      const askedYear = typeof args.year === 'number' ? Math.floor(args.year) : null;
+      const askedQuarterRaw = typeof args.quarter === 'string' ? args.quarter : null;
+      const askedQuarter = resolveQuarter(askedQuarterRaw);
+      if (askedQuarterRaw && !askedQuarter) {
+        return { found: false, reason: 'bad_quarter', hint: `"${askedQuarterRaw}" is not a recognized quarter. Pass "Q1".."Q4" or the release month ("january"/"april"/"july"/"october").` };
+      }
+      const rows = await pg<OppsRow>(cfg,
+        `opps_rates?hcpcs=eq.${hcpcs}${askedYear ? `&year=eq.${askedYear}` : ''}${askedQuarter ? `&quarter=eq.${askedQuarter}` : ''}`
+        + '&select=*&order=year.desc,quarter.desc&limit=5');
+      if (!rows.length) {
+        const any = await pg<{ year: number; quarter: string }>(cfg, 'opps_rates?select=year,quarter&order=year.desc,quarter.desc&limit=1');
+        const vintageMismatch = any.length && ((askedYear && any[0].year !== askedYear) || (askedQuarter && any[0].quarter !== askedQuarter));
+        return {
+          found: false,
+          reason: vintageMismatch ? 'year_not_loaded' : 'code_not_found',
+          hint: vintageMismatch
+            ? `No ${askedYear ?? '(any year)'} ${askedQuarter ?? '(any quarter)'} OPPS release is loaded; the newest is ${any[0].year} ${any[0].quarter}. Rates differ every quarter, so this will not answer with a different vintage's numbers.`
+            : `${hcpcs} is not on the OPPS Addendum B HCPCS list for the loaded vintage. This may be a physician, lab, or DMEPOS code instead — try medicare_physician_payment, medicare_lab_rate, or medicare_dmepos_rate.`,
+        };
+      }
+      const r = rows[0];
+      const si = r.status_indicator;
+      return {
+        found: true,
+        code: hcpcs,
+        // Vintage first, deliberately: it qualifies every number below it.
+        fee_schedule_year: r.year,
+        quarter: r.quarter,
+        year_was_defaulted: askedYear === null,
+        quarter_was_defaulted: askedQuarter === null,
+        status_indicator: si,
+        status_indicator_meaning: OPPS_SI[si] ?? `Status indicator ${si} (not in the mapped set)`,
+        apc: r.apc,
+        apc_note: r.apc == null
+          ? 'No APC is assigned for this status indicator — the code is not separately paid under OPPS (often packaged into another service\'s payment, or not an outpatient-department benefit at all). See status_indicator_meaning.'
+          : null,
+        relative_weight: r.relative_weight,
+        payment_rate_usd: r.payment_rate_usd,
+        national_unadjusted_copay_usd: r.national_unadjusted_copay_usd,
+        minimum_unadjusted_copay_usd: r.minimum_unadjusted_copay_usd,
+        ira_coinsurance_pct: r.ira_coinsurance_pct,
+        adjusted_beneficiary_copay_usd: r.adjusted_beneficiary_copay_usd,
+        device_pass_through: r.device_pass_through,
+        drug_or_biological_pass_through: r.drug_or_biological_pass_through,
+        pass_through_note: r.device_pass_through
+          ? 'This device is CURRENTLY on CMS pass-through status (SI=H): paid separately, outside the standard APC amount, for as long as that status lasts — typically 2-3 years from market entry, after which it is repriced (often packaged, SI=N).'
+          : r.drug_or_biological_pass_through
+            ? 'This drug/biological is CURRENTLY on CMS pass-through status (SI=G): paid separately at a rate outside the standard APC amount.'
+            : null,
+        changed_this_release: r.changed_this_release,
+        note: r.note,
+        source: 'CMS, OPPS Addendum B',
+        caveat: 'National OPPS amount before sequestration, beneficiary coinsurance adjustments, and any wage-index/rural adjustment applied at the claim level. This is the hospital-outpatient-department rate; the same code billed in a physician office or ASC uses a different schedule.',
+      };
+    }
+
     case 'medicare_code_units_limit': {
       const hcpcs = code(args.code);
       if (!hcpcs) return { found: false, reason: 'no_code', hint: 'Pass code, e.g. "99213".' };
@@ -1522,13 +2110,14 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     }
 
     case 'medicare_pricing_coverage': {
-      const [rvuN, gpciN, clfsN, mueN, ptpRange, dmeN] = await Promise.all([
+      const [rvuN, gpciN, clfsN, mueN, ptpRange, dmeN, oppsN] = await Promise.all([
         pg<{ year: number; release: string }>(cfg, 'pfs_rvu?select=year,release&order=year.desc&limit=1'),
         pg<{ year: number }>(cfg, 'pfs_gpci?select=year&order=year.desc&limit=1'),
         pg<{ year: number; quarter: string }>(cfg, 'clfs_rates?select=year,quarter&order=year.desc,quarter.desc&limit=1'),
         pg<{ effective_date: string }>(cfg, 'ncci_mue?select=effective_date&order=effective_date.desc&limit=1'),
         pg<{ first_seen_quarter: string; last_seen_quarter: string }>(cfg, 'ncci_ptp_edits?select=first_seen_quarter,last_seen_quarter&order=last_seen_quarter.desc&limit=1'),
         pg<{ year: number; release: string }>(cfg, 'dmepos_rates?select=year,release&order=year.desc,release.desc&limit=1'),
+        pg<{ year: number; quarter: string }>(cfg, 'opps_rates?select=year,quarter&order=year.desc,quarter.desc&limit=1'),
       ]);
       return {
         found: true,
@@ -1536,6 +2125,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         geographic_localities: gpciN.length ? { year: gpciN[0].year } : null,
         clinical_lab_fee_schedule: clfsN.length ? { year: clfsN[0].year, quarter: clfsN[0].quarter } : null,
         dmepos_fee_schedule: dmeN.length ? { year: dmeN[0].year, release: dmeN[0].release, release_month: DME_RELEASE_MONTH[dmeN[0].release] ?? null, priced_by: 'state (not Medicare locality), with separate rural/non-rural amounts' } : null,
+        hospital_outpatient_pps: oppsN.length ? { year: oppsN[0].year, quarter: oppsN[0].quarter, priced_by: 'HCPCS code, hospital outpatient department setting (status indicator + APC), source: CMS OPPS Addendum B' } : null,
         fqhc_pps_base_rate: { newest_loaded_year: FQHC_PPS_BASE_RATES[FQHC_PPS_BASE_RATES.length - 1].year, loaded_years: FQHC_PPS_BASE_RATES.map((r) => r.year), source: FQHC_SOURCE },
         medically_unlikely_edits: mueN.length ? { effective_from: mueN[0].effective_date } : null,
         procedure_to_procedure_edits: ptpRange.length ? {
@@ -1543,10 +2133,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           quarterly_overlay_window: '2025q1..2026q3 (re-applied on top of the baseline so a pair the quarterly files show deleted cannot be resurrected by an older baseline row)',
           coverage: 'FULL, not a rolling window: a pair with no row here has never had a CMS-recorded PTP edit as of the loaded vintage. Before fleet #1293 (2026-09-07) this only covered the 2025q1..2026q3 change window and a NOT-FOUND answer could not rule out a pre-2025 edit.',
         } : null,
-        refresh_cadence: 'Physician fee schedule annually (with intra-year releases); lab fee schedule, DMEPOS fee schedule, MUE units edits, and PTP pair-edit changes all quarterly (as necessary).',
+        refresh_cadence: 'Physician fee schedule annually (with intra-year releases); lab fee schedule, DMEPOS fee schedule, OPPS hospital-outpatient fee schedule, MUE units edits, and PTP pair-edit changes all quarterly (as necessary).',
         no_descriptions_note:
-          'CPT procedure descriptions (physician fee schedule, lab schedule) are not returned — American Medical Association copyright. DMEPOS is the exception: it uses HCPCS Level II codes, which CMS itself maintains, so medicare_dmepos_rate DOES return the code description.',
-        source: 'CMS Physician Fee Schedule, Clinical Laboratory Fee Schedule, DMEPOS fee schedule, FQHC PPS base payment rate, and National Correct Coding Initiative (MUE + PTP quarterly change files)',
+          'CPT procedure descriptions (physician fee schedule, lab schedule, OPPS) are not returned — American Medical Association copyright, and OPPS Addendum B mixes AMA CPT codes with CMS-owned HCPCS Level II codes under one descriptor column with no per-row way to separate them. DMEPOS is the exception: it is HCPCS Level II only, which CMS itself maintains, so medicare_dmepos_rate DOES return the code description.',
+        source: 'CMS Physician Fee Schedule, Clinical Laboratory Fee Schedule, DMEPOS fee schedule, OPPS Addendum B, FQHC PPS base payment rate, and National Correct Coding Initiative (MUE + PTP quarterly change files)',
       };
     }
 
