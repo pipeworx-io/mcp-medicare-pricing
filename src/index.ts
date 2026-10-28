@@ -1441,13 +1441,13 @@ const tools: McpToolExport['tools'] = [
     name: 'medicare_fqhc_gaf',
     description:
       'What is the FQHC Geographic Adjustment Factor (GAF) for a place, and what does Medicare pay a Federally Qualified Health Center per visit THERE? Returns the official CMS FQHC PPS GAF for a Medicare locality and calendar year, and the GAF-adjusted per-visit rate (national base rate x GAF). Answers "FQHC PPS GAF for Orlando, Florida 2025", "CY2026 FQHC geographic adjustment Rest of California", "what is the FQHC PPS rate in Alaska". '
-      + 'The GAF is CMS\'s own published number per locality (adapted from the work and practice-expense GPCIs, with the 1.0 floor), not something this tool estimates. A state returns all its localities; a city is not a locality, so name the locality or pick from the list (Florida has Fort Lauderdale, Miami and Rest of Florida). Complements medicare_fqhc_pps_rate (national base rate) and medicare_gpci_lookup (the underlying GPCIs). Years 2024-2026 loaded. Sourced from the CMS FQHC PPS geographic adjustment factor tables.',
+      + 'The GAF is CMS\'s own published number per locality (adapted from the work and practice-expense GPCIs, with the 1.0 floor), not something this tool estimates. A state returns all its localities; a city is not a locality, so name the locality or pick from the list (Florida has Fort Lauderdale, Miami and Rest of Florida). Complements medicare_fqhc_pps_rate (national base rate) and medicare_gpci_lookup (the underlying GPCIs). Years 2018-2026 loaded; the GAF-adjusted rate is returned for 2022-2026 (years whose national base rate this pack carries) and is null with a stated reason for 2018-2021. Sourced from the CMS FQHC PPS geographic adjustment factor tables.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         locality: { type: 'string', description: 'State code ("FL"), state name ("Florida"), or Medicare locality name ("Fort Lauderdale", "Rest of Florida"). A bare state returns all of its localities.' },
         locality_number: { type: 'string', description: 'Optional Medicare locality number, e.g. "99"; with a state it pins one locality.' },
-        year: { type: 'number', description: 'Calendar year, 2024-2026. Omit for the newest loaded year (stated in the response).' },
+        year: { type: 'number', description: 'Calendar year, 2018-2026. Omit for the newest loaded year (stated in the response).' },
       },
     },
   },
@@ -1584,6 +1584,7 @@ function fqhcGafLookup(args: Record<string, unknown>) {
     localities,
     locality_count: localities.length,
     base_rate_usd: base?.base_rate_usd ?? null,
+    base_rate_note: base ? undefined : `The national FQHC PPS base rate for CY ${year} is not carried in this pack, so no GAF-adjusted rate is computed; the GAF itself is CMS's published value for ${year}.`,
     formula: base ? `FQHC PPS base rate $${base.base_rate_usd.toFixed(2)} x FQHC GAF = per-visit rate (before the new-patient / IPPE / AWV add-on and the lesser-of-charges rule)` : null,
     note: localities.length > 1
       ? `${cityNote}${localities.length} Medicare localities matched and their GAFs differ; a city is not a locality — pick the locality that contains the health center.`

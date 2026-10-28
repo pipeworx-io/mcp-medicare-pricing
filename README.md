@@ -4,7 +4,7 @@ What Medicare **pays** — physician fee schedule, lab rates, and per-day unit
 limits. The companion to `medicare-coverage`, which answers whether something is
 covered but not what it is worth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -60,11 +60,11 @@ locality is `medicare_fqhc_gaf` (below).
 for a locality or a whole state with no procedure code (years 2024-2026 loaded;
 2024 and 2025 were backfilled with `scripts/ingest-medicare-pricing.mjs
 --gpci-only`). `medicare_fqhc_gaf` returns CMS's own published FQHC GAF per
-locality for CY2024-2026 and the GAF-adjusted per-visit rate. The GAF table is
+locality for CY2018-2026 (each year from CMS's own GAF publication for that year; 2018 uses CMS's February 2018 updated table, 2021 and 2020 the updated releases) and the GAF-adjusted per-visit rate (2022-2026; null for 2018-2021, whose national base rate is not carried). The GAF table is
 CMS's published number, not derived here, and is a small generated source file
-(`src/fqhc-gaf.ts`, 109 localities per year). **Refresh** each January: download
+(`src/fqhc-gaf.ts`, 109-112 localities per year; ~50 KB). **Refresh** each January: download
 the new year's FQHC GAF file from CMS and run
-`node scripts/build-fqhc-gaf-table.mjs 2024=<csv> 2025=<csv> 2026=<csv> 2027=<csv>`.
+`node scripts/build-fqhc-gaf-table.mjs 2018=<file> ... 2026=<file> 2027=<file>` (ascending; the script finds columns by header name because CMS's layout changes yearly).
 
 **Refresh**: CMS issues the following year's transmittal in Nov/Dec (the
 CY2026 update was dated 2025-12-05 for a Jan 1, 2026 effective date). Add a
@@ -407,7 +407,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1882+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
