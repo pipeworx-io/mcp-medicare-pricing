@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-medicare-pricing",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "What does Medicare PAY — physician fee schedule, lab rates, and per-day unit limits.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-medicare-pricing": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "medicare-pricing"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-medicare-pricing.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/medicare-pricing",
   "pipeworx": {
-    "sourceHash": "v1-32efb7ed0c4d3e07bb87e0c09fa0d3f646b4bf25458c73e8f350a248a1e66888",
-    "sourceCommit": "f54ad77e789f27fe393978f9c080b5b18c87bb4f"
+    "mode": "gateway",
+    "slug": "medicare-pricing",
+    "gatewaySlug": "medicare-pricing",
+    "sourceHash": "v1-c62d25dd11c83b2f692e274229570e98919c412ad90e56990079bdccb6b09c34",
+    "sourceCommit": "5c89d6abb778d45da5d92002eb251978622bedf9"
   }
 }
